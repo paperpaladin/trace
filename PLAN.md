@@ -15,17 +15,19 @@ output.
 
 ## Oracle
 
-1. `strace -c` -- an independently written tracer must agree on per-syscall
-   counts. Currently agrees on `write`, `openat`, `close`, `fsync`.
-2. `t/workload.c` -- ground truth with exactly known counts, built `-static` so
-   `ld.so` contributes nothing.
+1. `strace -c` and `strace -f -c` -- an independently written tracer must agree on
+   per-syscall counts, single-process and multi-process. Currently agrees on
+   `write`, `openat`, `close` and `fsync`, and on `write`/`clone` across a
+   4-process tree.
+2. `t/workload.c` and `t/forker.c` -- ground truth with exactly known counts, both
+   built `-static` so `ld.so` contributes nothing. That matters twice over in the
+   forking case, since `ld.so` would otherwise run again in every child.
 3. The transparency checks, which are their own oracle: the untraced run is the
    reference.
 
 ## Non-goals (for generation one)
 
-Following children. Full struct decoding. Attaching to a running pid. Any
-architecture but x86-64. Those belong to a tracer people use; this one exists to
+Full struct decoding. Attaching to a running pid. Any architecture but x86-64. Those belong to a tracer people use; this one exists to
 be the slow, complete baseline that generations two and three are measured
 against.
 
@@ -45,18 +47,25 @@ against.
       why: restarting from the signal branch left the tracee running, so the
            next PTRACE_SYSCALL got ESRCH and a SIGTERM death reported as exit 0
 - [x] 06 fix: handle exec failure, where there is no stop to attach options to
+- [x] 07 follow fork/vfork/clone with `-f`: per-pid state table, `waitpid(-1)`
+      with `__WALL`, `PTRACE_GETEVENTMSG` to learn each child's pid
+      why: single-process tracing is useless on anything that spawns, and this is
+           where the state machine stops being trivial
+      files: trace.c t/forker.c t/run.sh
+      proves: `strace -f` agrees on write (4) and clone (3) across a known
+              4-process tree; transparency holds with three children sharing stdout
+- [x] 08 fix: route every restart through one place; propagate a signal death
+      why: both were reintroductions of bugs 05 and 06, caught immediately by the
+           transparency test that existed before any feature did
 
 ### Milestone 1 -- a tracer that is actually usable
 
-- [ ] 07 follow children: `PTRACE_O_TRACEFORK|TRACEVFORK|TRACECLONE`, a pid
-      table, and per-pid entering/exiting state
-      why: single-process tracing is useless on anything that spawns. This is
-           also where the state machine stops being trivial.
-- [ ] 08 `-e name,name` filtering, and `-p PID` to attach to a running process
-- [ ] 09 decode the argument structs that matter: `struct stat`, `iovec`,
+- [ ] 09 `-e name,name` filtering, and `-p PID` to attach to a running process
+- [ ] 10 decode the argument structs that matter: `struct stat`, `iovec`,
       `sockaddr`, open flags as symbolic names
-- [ ] 10 `-T` per-call timing, which is the prerequisite for the overhead table
-- [ ] 11 a second ground-truth workload that forks, so 07 has an oracle
+- [ ] 11 `-T` per-call timing, which is the prerequisite for the overhead table
+- [ ] 12 `PTRACE_O_TRACEEXEC`, so an exec inside a followed child is visible as an
+      event rather than only as a syscall
 
 ### Milestone 2 -- generation two: seccomp user notification
 

@@ -19,8 +19,14 @@ ok   strace agrees on fsync (1)
 ok   decodes openat path argument
 ok   decodes -errno into a name
 ok   escapes newline in a path
+ok   stdout unchanged under -f
+ok   without -f sees only the parent's write
+ok   with -f sees all 4 writes
+ok   counts 3 clones
+ok   strace -f agrees on write (4)
+ok   strace -f agrees on clone (3)
 
-15 passed, 0 failed
+23 passed, 0 failed
 ```
 
 ```
@@ -59,10 +65,38 @@ each syscall -- built `-static` on purpose, because a dynamically linked binary
 has `ld.so` issuing a dozen `openat` and `mmap` calls before `main` and the
 expected numbers stop being exact.
 
-## Writing this found two real bugs
+## Following children
 
-Both were in signal and exit handling, which is where every ptrace tutorial
-stops caring:
+`-f` follows `fork`, `vfork` and `clone`. This is where the state machine stops
+being trivial: the entering/exiting phase and the outstanding syscall number are
+**per process**, so the two globals holding them had to become a table keyed by
+pid. The loop waits on `-1` with `__WALL`, because any tracee may stop next and
+cloned threads must be reported too.
+
+`PTRACE_O_TRACE{FORK,VFORK,CLONE}` makes the kernel attach the tracer to each new
+child automatically and hand over its pid via `PTRACE_GETEVENTMSG`. That closes
+the race you would otherwise have between a child being created and the tracer
+learning it exists -- and a child that `waitpid` reports *before* its parent's
+event stop is adopted on sight rather than dropped.
+
+```
+$ trace -cf ./forker        # parent plus three children
+       4        0 write
+       3        0 clone
+
+$ trace -c ./forker         # parent only
+       1        0 write
+       3        0 clone
+```
+
+Only the root process's exit status is propagated, so `trace` stays transparent in
+a pipeline. The `[pid]` prefix appears only under `-f`, so single-process output is
+byte-identical to what it was before the flag existed.
+
+## Writing this found four real bugs
+
+All four in signal, exit and restart handling -- which is where every ptrace
+tutorial stops caring:
 
 1. After passing a signal through with `PTRACE_SYSCALL`, the tracee is already
    running. The loop then issued another `PTRACE_SYSCALL`, got `ESRCH`, broke out,
@@ -73,20 +107,28 @@ stops caring:
    options to and the child has already exited. `PTRACE_SETOPTIONS` returned
    `ESRCH` and the tracer reported its own error instead of the child's 127.
 
-Neither is visible if you only ever trace programs that succeed.
+3. Restructuring for `-f` moved `waitpid` to the top of the loop, but the exec
+   stop had already been consumed before the loop began -- so nothing ever
+   restarted the tracee and it hung forever waiting for a stop that had already
+   happened.
+4. The rewritten exit path returned `WEXITSTATUS` unconditionally, which reports 0
+   for a signal death. That is bug 1 again, reintroduced by the rewrite. The
+   transparency test caught it on the first run, which is the whole argument for
+   having written that test before any of the features.
+
+Neither of the first two is visible if you only ever trace programs that succeed.
 
 ## Status
 
 Works. Decodes syscall names from a sparse x86-64 table, path arguments for the
-`open`/`stat`/`unlink` families, and `-errno` returns into names. Paths are
-escaped on output, so a filename containing a newline cannot forge a line of
-trace output.
+`open`/`stat`/`unlink` families, and `-errno` returns into names. Paths are escaped
+on output, so a filename containing a newline cannot forge a line of trace output.
+Follows children with `-f`.
 
-Not implemented: following `fork`/`clone` into children (single process only),
-full argument decoding for structs like `struct stat`, syscall filtering by name,
-attaching to an already-running pid, or any architecture but x86-64. The syscall
-table covers roughly 110 numbers; anything else prints as `syscall_N`, which is
-honest rather than wrong.
+Not implemented: full argument decoding for structs like `struct stat`, syscall
+filtering by name, per-call timing, attaching to an already-running pid, or any
+architecture but x86-64. The syscall table covers roughly 110 numbers; anything
+else prints as `syscall_N`, which is honest rather than wrong.
 
 ## License
 
