@@ -1,4 +1,4 @@
-CFLAGS = -std=c11 -g -O1 -Wall -Wextra
+CFLAGS = -std=c11 -g -O1 -Wall -Wextra -ffile-prefix-map=$(CURDIR)=.
 
 trace: trace.c
 	$(CC) $(CFLAGS) -o $@ $<
