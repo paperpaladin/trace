@@ -60,7 +60,35 @@ against.
 
 ### Milestone 1 -- a tracer that is actually usable
 
-- [ ] 09 `-e name,name` filtering, and `-p PID` to attach to a running process
+- [x] 09 `-e name,name` filtering
+      why: the first thing anyone reaches for on a tracer whose output is
+      thousands of lines long, and the cheapest useful feature left.
+      done: also accepts strace's `-e trace=name,name` spelling, which is what
+      the harness passes to both programs so the differential compares the
+      same request. Filtering applies to reporting, not counting, so a
+      filtered count equals an unfiltered one and the summary then shows only
+      what passed -- matching `strace -c -e`. An unknown name exits 2 rather
+      than matching nothing, because a typo that silently filters everything
+      out reads exactly like a program making no calls. Ten assertions. The
+      one worth having: a call is printed by two stops, name and arguments on
+      entry and result on exit, so gating one half leaves orphan `) = 0`
+      lines -- asserted by requiring every line to be a complete call, which
+      is the mutation that would otherwise have shipped.
+      Split from `-p PID`, which is now item 09b: it turns on
+      `kernel.yama.ptrace_scope`, so both the feature and its test change
+      shape with a sysctl this repo does not control, and that deserves its
+      own commit rather than riding along with a flag parser.
+- [ ] 09b `-p PID` to attach to a running process
+      why: the other half of what people use a tracer for -- something is
+      already wedged and you want to see what it is doing, without restarting
+      it. PTRACE_SEIZE rather than PTRACE_ATTACH, because SEIZE does not stop
+      the process and does not need the stop-signal dance. The test has to
+      create its own target, attach, observe a known syscall and detach,
+      leaving the target running and unchanged -- transparency means something
+      stricter here than it does for a child we started. Note that
+      `ptrace_scope` is 0 on this machine and 1 on most distributions, where
+      only descendants may be attached; the harness must detect that and skip
+      loudly rather than fail.
 - [ ] 10 decode the argument structs that matter: `struct stat`, `iovec`,
       `sockaddr`, open flags as symbolic names
 - [ ] 11 `-T` per-call timing, which is the prerequisite for the overhead table

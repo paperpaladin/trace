@@ -157,6 +157,86 @@ if command -v strace >/dev/null 2>&1; then
   done
 fi
 
-rm -f t/workload.bin t/forker.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp
+# ------------------------------------------------------------ 6. -e filtering
+
+# Filtering decides what is reported, not what is counted, so a filtered count
+# must equal the unfiltered one for the same syscall. If -e changed the number
+# then the filter would be interfering with the measurement rather than with
+# the output.
+./trace -c -e write ./t/workload.bin >/dev/null 2>t/ef.tmp
+fw=$(count_of write t/ef.tmp)
+[ "$fw" = 13 ] && ok "-e write: count unchanged by filtering (13)" \
+                || bad "-e write: got $fw, want 13"
+
+# ...and nothing else may appear. One syscall row plus the total row.
+rows=$(grep -cE '^ *[0-9]+ ' t/ef.tmp)
+[ "$rows" = 2 ] && ok "-e write: summary has only write and total" \
+                 || bad "-e write: summary has $rows numbered rows, want 2"
+
+# The strace spelling of the same flag has to mean the same thing, because the
+# oracle below is invoked with it and the comparison is worthless otherwise.
+./trace -c -e trace=write ./t/workload.bin >/dev/null 2>t/ef2.tmp
+cmp -s t/ef.tmp t/ef2.tmp && ok "-e trace=write is the same as -e write" \
+                          || bad "-e and -e trace= disagree"
+
+# Per-call output. Every line must be a write, and -- the part that is easy to
+# get wrong -- there must be no orphans. One call is printed by two stops, the
+# name and arguments on entry and the result on exit, so a filter applied to
+# only one of them leaves a dangling "(" or a bare ") = 0".
+./trace -e write ./t/workload.bin >/dev/null 2>t/ec.tmp
+if [ -s t/ec.tmp ] && ! grep -qvE '^write\(.*\) = ' t/ec.tmp; then
+  ok "-e write: every line is a complete write call ($(wc -l < t/ec.tmp) of them)"
+else
+  bad "-e write: output has non-write or incomplete lines" \
+      "$(grep -nvE '^write\(.*\) = ' t/ec.tmp | head -3)"
+fi
+
+# Two names means both and nothing else.
+./trace -e write,close ./t/workload.bin >/dev/null 2>t/ec2.tmp
+if ! grep -qvE '^(write|close)\(' t/ec2.tmp && grep -q '^close(' t/ec2.tmp; then
+  ok "-e write,close: both appear and nothing else"
+else
+  bad "-e write,close: wrong set of calls" "$(grep -vE '^(write|close)\(' t/ec2.tmp | head -3)"
+fi
+
+# A typo must be refused rather than quietly matching nothing, which would
+# read exactly like a program that makes no syscalls at all. strace exits 1
+# and says "invalid system call"; we exit 2 because 2 is this program's own
+# usage status, and say the same thing.
+./trace -e nosuchcall ./t/workload.bin >/dev/null 2>t/ebad.tmp
+rc=$?
+[ "$rc" = 2 ] && ok "-e with an unknown name exits 2" \
+              || bad "-e with an unknown name exited $rc, want 2"
+grep -q "invalid system call 'nosuchcall'" t/ebad.tmp \
+  && ok "-e names the syscall it did not recognise" \
+  || bad "-e did not name the bad syscall"
+
+# Transparency still holds with a filter on: suppressing output must not
+# change the traced program.
+fout=$(./trace -e write ./t/workload.bin 2>/dev/null); frc=$?
+[ "$frc" = "$untraced_rc" ] && [ "$fout" = "$untraced_out" ] \
+  && ok "-e does not change the traced program" \
+  || bad "-e changed the program: rc=$frc want $untraced_rc"
+
+# The oracle. strace filters its own summary the same way, and must agree on
+# the number -- having first confirmed the number is not zero, because two
+# empty outputs compare equal and prove nothing.
+if command -v strace >/dev/null 2>&1; then
+  strace -c -e trace=write -o t/sef.tmp ./t/workload.bin >/dev/null 2>&1
+  theirs=$(awk '$NF == "write" { print $4; f=1 } END { if (!f) print 0 }' t/sef.tmp)
+  if [ "$theirs" = 0 ]; then
+    bad "strace -e write counted nothing, so the comparison is vacuous"
+  elif [ "$fw" = "$theirs" ]; then
+    ok "strace -e trace=write agrees on write ($fw)"
+  else
+    bad "strace -e disagrees: trace=$fw strace=$theirs"
+  fi
+  # And strace's filtered summary must also contain only write.
+  srows=$(awk '$NF != "" && $1 ~ /^[0-9]/ { n++ } END { print n+0 }' t/sef.tmp)
+  [ "$srows" = 2 ] && ok "strace -e also reports a single syscall row" \
+                   || bad "strace -e reported $srows rows; the oracle is not comparable"
+fi
+
+rm -f t/workload.bin t/forker.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

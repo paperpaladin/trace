@@ -26,7 +26,7 @@ ok   counts 3 clones
 ok   strace -f agrees on write (4)
 ok   strace -f agrees on clone (3)
 
-23 passed, 0 failed
+33 passed, 0 failed
 ```
 
 ```
@@ -123,12 +123,41 @@ Neither of the first two is visible if you only ever trace programs that succeed
 Works. Decodes syscall names from a sparse x86-64 table, path arguments for the
 `open`/`stat`/`unlink` families, and `-errno` returns into names. Paths are escaped
 on output, so a filename containing a newline cannot forge a line of trace output.
-Follows children with `-f`.
+Follows children with `-f`. Filters by name with `-e`.
 
-Not implemented: full argument decoding for structs like `struct stat`, syscall
-filtering by name, per-call timing, attaching to an already-running pid, or any
-architecture but x86-64. The syscall table covers roughly 110 numbers; anything
-else prints as `syscall_N`, which is honest rather than wrong.
+### `-e`
+
+`trace -e write,close CMD` reports only those calls. `-e trace=write,close` is
+accepted too, which is strace's spelling, and is the spelling the test harness
+uses because it has to pass the same list to both programs.
+
+Filtering decides what is *reported*, not what is counted, so `-c -e write`
+shows the same number for `write` that an unfiltered run does. The summary then
+shows only the calls that passed the filter, which is what `strace -c -e` does.
+
+An unrecognised name is refused with `invalid system call 'name'` and exit 2,
+rather than producing an empty filter. A typo that quietly matched nothing
+would read exactly like a program that makes no syscalls, which is the kind of
+silence this project tries not to produce. strace refuses too, though it exits
+1 where this exits 2, because 2 is this program's own usage status.
+
+### What does not work
+
+- **Full argument decoding.** Structs like `struct stat`, `iovec` and
+  `sockaddr` print as hex pointers. Open flags print as a number, not as
+  `O_RDONLY|O_CLOEXEC`.
+- **No per-call timing.** `-T` is absent, which is what blocks the
+  three-generation overhead table this project exists to produce.
+- **No attaching to a running process.** `-p PID` is the next item in
+  `PLAN.md`; it was split out of the same plan item as `-e` because it is a
+  different kind of problem -- it depends on `kernel.yama.ptrace_scope`, which
+  on a machine set to 1 permits attaching only to descendants, so the feature
+  and its test both change shape with a sysctl this repo does not control.
+- **x86-64 only**, and the syscall table covers roughly 110 numbers. Anything
+  outside it prints as `syscall_N`, which is honest rather than wrong.
+- **`-e` filters by name only.** strace also takes classes (`-e trace=file`,
+  `%net`), negation (`-e trace=!write`), and `-e` qualifiers other than
+  `trace`. None of those are here.
 
 ## License
 

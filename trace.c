@@ -57,6 +57,51 @@ static const char *SYSCALL_NAME[] = {
 
 static long counts[512];
 static long errors[512];
+
+// -e: which syscalls to report, by number. Empty means all of them, which is
+// why there is a separate flag rather than a table filled in with true -- "no
+// -e given" and "-e naming everything" should behave the same, and they do,
+// but only one of them can be distinguished from "-e naming nothing".
+static bool shown[512];
+static bool filtering = false;
+
+static bool is_shown(long nr) {
+  if (!filtering) return true;
+  return nr >= 0 && nr < 512 && shown[nr];
+}
+
+// Parse "-e read,write" or "-e trace=read,write". The second spelling is
+// strace's, accepted here so the flag can be copied between the two without
+// editing -- which matters because the oracle is invoked with the same list.
+//
+// An unknown name is an error rather than a silently empty filter. strace
+// refuses too, and the alternative is a typo producing a quiet "no syscalls
+// matched" that reads exactly like a program making no calls.
+static int parse_filter(const char *list) {
+  if (!strncmp(list, "trace=", 6)) list += 6;
+  if (!*list) { fprintf(stderr, "trace: -e needs at least one name\n"); return 2; }
+
+  while (*list) {
+    const char *end = strchr(list, ',');
+    size_t len = end ? (size_t)(end - list) : strlen(list);
+    bool found = false;
+    for (size_t nr = 0; nr < NSYSCALL && nr < 512; nr++) {
+      if (SYSCALL_NAME[nr] && strlen(SYSCALL_NAME[nr]) == len &&
+          !strncmp(SYSCALL_NAME[nr], list, len)) {
+        shown[nr] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      fprintf(stderr, "trace: invalid system call '%.*s'\n", (int)len, list);
+      return 2;
+    }
+    list = end ? end + 1 : list + len;
+  }
+  filtering = true;
+  return 0;
+}
 static bool count_only = false;
 static bool follow = false;        // -f: trace children too
 static pid_t root_pid;             // whose exit status we propagate
@@ -168,7 +213,7 @@ static void print_summary(void) {
   int n = 0;
   long total = 0;
   for (long i = 0; i < 512; i++)
-    if (counts[i]) { idx[n++] = i; total += counts[i]; }
+    if (counts[i] && is_shown(i)) { idx[n++] = i; total += counts[i]; }
 
   qsort(idx, n, sizeof(long), cmp_count);
 
@@ -184,13 +229,24 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[argi], "-c")) count_only = true;
     else if (!strcmp(argv[argi], "-f")) follow = true;
     else if (!strcmp(argv[argi], "-cf") || !strcmp(argv[argi], "-fc")) { count_only = follow = true; }
+    else if (!strcmp(argv[argi], "-e")) {
+      if (argi + 1 >= argc) { fprintf(stderr, "trace: -e needs a list\n"); return 2; }
+      int rc = parse_filter(argv[++argi]);
+      if (rc) return rc;
+    }
+    else if (!strncmp(argv[argi], "-e", 2) && argv[argi][2]) {
+      int rc = parse_filter(argv[argi] + 2);  // -eread,write, as strace allows
+      if (rc) return rc;
+    }
     else if (!strcmp(argv[argi], "--")) { argi++; break; }
     else { fprintf(stderr, "trace: unknown option %s\n", argv[argi]); return 2; }
   }
   if (argi >= argc) {
-    fprintf(stderr, "usage: trace [-c] [-f] CMD [ARGS...]\n"
-                    "  -c   print a per-syscall summary instead of each call\n"
-                    "  -f   follow fork, vfork and clone into children\n");
+    fprintf(stderr, "usage: trace [-c] [-f] [-e LIST] CMD [ARGS...]\n"
+                    "  -c        print a per-syscall summary instead of each call\n"
+                    "  -f        follow fork, vfork and clone into children\n"
+                    "  -e LIST   report only these syscalls, comma separated.\n"
+                    "            'trace=' may prefix the list, as in strace.\n");
     return 2;
   }
 
@@ -256,7 +312,8 @@ int main(int argc, char **argv) {
     }
 
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
-      if (!t->entering && t->pending_nr >= 0 && !count_only) {
+      if (!t->entering && t->pending_nr >= 0 && !count_only &&
+          is_shown(t->pending_nr)) {
         // exit_group produces no syscall-exit stop, so the last call is still
         // outstanding. Report it unreturned rather than dropping it.
         line_prefix(who);
@@ -304,7 +361,11 @@ int main(int argc, char **argv) {
       t->pending_nr = nr;
       if (nr >= 0 && nr < 512) counts[nr]++;
 
-      if (!count_only) {
+      // The filter is applied here and again on the exit half below, both
+      // keyed on the same number, because one call is printed by two stops:
+      // the name and arguments on entry, the result on exit. Gating only one
+      // of them would leave a dangling open paren or an orphan " = 0".
+      if (!count_only && is_shown(nr)) {
         int pi = path_arg(nr);
         unsigned long a[6] = { regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9 };
         line_prefix(who);
@@ -326,7 +387,7 @@ int main(int argc, char **argv) {
       bool is_err = (ret < 0 && ret > -4096);
       if (is_err && nr >= 0 && nr < 512) errors[nr]++;
 
-      if (!count_only) {
+      if (!count_only && is_shown(nr)) {
         if (is_err) fprintf(stderr, ") = -1 %s\n", strerror((int)-ret));
         else        fprintf(stderr, ") = %ld\n", ret);
       }
