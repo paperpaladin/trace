@@ -78,7 +78,7 @@ against.
       `kernel.yama.ptrace_scope`, so both the feature and its test change
       shape with a sysctl this repo does not control, and that deserves its
       own commit rather than riding along with a flag parser.
-- [ ] 09b `-p PID` to attach to a running process
+- [x] 09b `-p PID` to attach to a running process
       why: the other half of what people use a tracer for -- something is
       already wedged and you want to see what it is doing, without restarting
       it. PTRACE_SEIZE rather than PTRACE_ATTACH, because SEIZE does not stop
@@ -89,6 +89,15 @@ against.
       `ptrace_scope` is 0 on this machine and 1 on most distributions, where
       only descendants may be attached; the harness must detect that and skip
       loudly rather than fail.
+      done: PTRACE_SEIZE plus PTRACE_INTERRUPT, and the detail the whole item
+      turns on -- EXITKILL is set for a command we started and deliberately
+      not set when attaching, because killing a process that was running
+      before we arrived, because we exited, is the worst thing this program
+      could do. Ten assertions, with a new t/looper.c as the target. The two
+      that matter read /proc/PID/stat after the tracer is gone: the target
+      must still exist and must not be in state T, since a process stopped
+      forever looks alive to kill -0. Adding EXITKILL to the attach options
+      turns exactly those red.
 - [ ] 10 decode the argument structs that matter: `struct stat`, `iovec`,
       `sockaddr`, open flags as symbolic names
 - [ ] 11 `-T` per-call timing, which is the prerequisite for the overhead table

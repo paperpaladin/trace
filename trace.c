@@ -103,6 +103,7 @@ static int parse_filter(const char *list) {
   return 0;
 }
 static bool count_only = false;
+static pid_t attach_pid = 0;   // -p: trace this instead of starting a command
 static bool follow = false;        // -f: trace children too
 static pid_t root_pid;             // whose exit status we propagate
 
@@ -223,6 +224,50 @@ static void print_summary(void) {
   fprintf(stderr, "%8ld %8s %-20s\n", total, "", "total");
 }
 
+// -p: take over a process that is already running.
+//
+// PTRACE_SEIZE rather than PTRACE_ATTACH. ATTACH sends SIGSTOP and leaves a
+// stop the tracer has to recognise and swallow, and getting that dance wrong
+// is how an attached process ends up stopped forever. SEIZE does not signal
+// the target at all, and it is the only way to set options and attach in one
+// operation, which matters because between an attach and a SETOPTIONS the
+// target is running untraced.
+//
+// EXITKILL is deliberately NOT in these options, where it is in the options
+// for a process we started ourselves. There it means "do not leave an orphan
+// stopped forever if the tracer dies". Here the process is not ours, it was
+// running before we arrived, and killing it because our own process exited
+// would be the worst thing this program could do.
+//
+// PTRACE_INTERRUPT after the seize, because SEIZE leaves the target running
+// and PTRACE_SYSCALL needs it stopped. The group-stop that produces is what
+// the main loop's first waitpid collects.
+static int attach(pid_t pid) {
+  long opts = PTRACE_O_TRACESYSGOOD;
+  if (follow) opts |= PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE;
+
+  if (ptrace(PTRACE_SEIZE, pid, 0, (void *)opts) < 0) {
+    // EPERM here is usually not a permission problem in the usual sense: it is
+    // kernel.yama.ptrace_scope refusing an attach to a process that is not a
+    // descendant. Saying so saves the next person the hour.
+    fprintf(stderr, "trace: cannot attach to %d: %s\n", (int)pid, strerror(errno));
+    if (errno == EPERM)
+      fprintf(stderr, "trace: check kernel.yama.ptrace_scope; 1 allows "
+                      "attaching only to descendants\n");
+    return 1;
+  }
+  if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0) {
+    perror("PTRACE_INTERRUPT");
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    return 1;
+  }
+
+  root_pid = pid;
+  tracee_add(pid);
+  if (!count_only) fprintf(stderr, "+++ attached to %d +++\n", (int)pid);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int argi = 1;
   for (; argi < argc && argv[argi][0] == '-'; argi++) {
@@ -238,18 +283,41 @@ int main(int argc, char **argv) {
       int rc = parse_filter(argv[argi] + 2);  // -eread,write, as strace allows
       if (rc) return rc;
     }
+    else if (!strcmp(argv[argi], "-p")) {
+      if (argi + 1 >= argc) { fprintf(stderr, "trace: -p needs a pid\n"); return 2; }
+      char *end;
+      long v = strtol(argv[++argi], &end, 10);
+      if (*end || v <= 0) {
+        fprintf(stderr, "trace: -p: not a pid: %s\n", argv[argi]);
+        return 2;
+      }
+      attach_pid = (pid_t)v;
+    }
     else if (!strcmp(argv[argi], "--")) { argi++; break; }
     else { fprintf(stderr, "trace: unknown option %s\n", argv[argi]); return 2; }
   }
-  if (argi >= argc) {
+  if (attach_pid && argi < argc) {
+    fprintf(stderr, "trace: -p takes a pid, not a command\n");
+    return 2;
+  }
+  if (!attach_pid && argi >= argc) {
     fprintf(stderr, "usage: trace [-c] [-f] [-e LIST] CMD [ARGS...]\n"
+                    "       trace [-c] [-f] [-e LIST] -p PID\n"
                     "  -c        print a per-syscall summary instead of each call\n"
                     "  -f        follow fork, vfork and clone into children\n"
                     "  -e LIST   report only these syscalls, comma separated.\n"
-                    "            'trace=' may prefix the list, as in strace.\n");
+                    "            'trace=' may prefix the list, as in strace.\n"
+                    "  -p PID    attach to a running process and trace until it\n"
+                    "            exits or this is interrupted\n");
     return 2;
   }
 
+  int status;
+
+  if (attach_pid) {
+    int rc = attach(attach_pid);
+    if (rc) return rc;
+  } else {
   pid_t pid = fork();
   if (pid < 0) { perror("fork"); return 1; }
 
@@ -262,7 +330,6 @@ int main(int argc, char **argv) {
   }
 
   root_pid = pid;
-  int status;
   if (waitpid(pid, &status, 0) < 0) { perror("waitpid"); return 1; }
 
   // If execvp failed there was never an exec, so there is no stop to attach
@@ -284,12 +351,14 @@ int main(int argc, char **argv) {
   }
 
   tracee_add(pid);
-  int root_status = 0;
 
   // The exec stop was already consumed above, so the tracee is stopped and
   // nothing has restarted it. The loop below begins with waitpid, so it must be
   // running by then or we wait forever for a stop that already happened.
   if (ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0) { perror("PTRACE_SYSCALL"); return 1; }
+  }
+
+  int root_status = 0;
 
   // One loop for every process. waitpid(-1) because any tracee may stop next,
   // and __WALL so clone()d threads are reported too.

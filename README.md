@@ -26,7 +26,7 @@ ok   counts 3 clones
 ok   strace -f agrees on write (4)
 ok   strace -f agrees on clone (3)
 
-33 passed, 0 failed
+43 passed, 0 failed
 ```
 
 ```
@@ -123,7 +123,8 @@ Neither of the first two is visible if you only ever trace programs that succeed
 Works. Decodes syscall names from a sparse x86-64 table, path arguments for the
 `open`/`stat`/`unlink` families, and `-errno` returns into names. Paths are escaped
 on output, so a filename containing a newline cannot forge a line of trace output.
-Follows children with `-f`. Filters by name with `-e`.
+Follows children with `-f`. Filters by name with `-e`. Attaches to a running
+process with `-p`.
 
 ### `-e`
 
@@ -141,6 +142,30 @@ would read exactly like a program that makes no syscalls, which is the kind of
 silence this project tries not to produce. strace refuses too, though it exits
 1 where this exits 2, because 2 is this program's own usage status.
 
+### `-p`
+
+`trace -p PID` takes over a process that is already running, which is the case
+a tracer is usually wanted for: something is wedged and restarting it would
+destroy the evidence.
+
+`PTRACE_SEIZE`, not `PTRACE_ATTACH`. ATTACH sends `SIGSTOP` and leaves a stop
+the tracer has to recognise and swallow; getting that wrong is how an attached
+process ends up stopped forever. SEIZE does not signal the target at all, and
+it is the only form that attaches and sets options in one operation -- between
+a bare attach and a later `SETOPTIONS` the target runs untraced.
+
+`PTRACE_O_EXITKILL` is set when tracing a command we started and deliberately
+**not** set when attaching. For our own child it means "do not leave an orphan
+stopped forever if the tracer dies". For a process that was running before we
+arrived, it would mean killing someone else's program because we exited, which
+is the worst thing this program could do. The suite asserts the difference by
+reading `/proc/PID/stat` after the tracer is gone: the target must still exist
+*and* must not be in state `T`, because a process stopped forever looks alive
+to `kill -0`.
+
+`EPERM` on attach is usually `kernel.yama.ptrace_scope` rather than a
+permission problem in the ordinary sense, so the error says so.
+
 ### What does not work
 
 - **Full argument decoding.** Structs like `struct stat`, `iovec` and
@@ -148,11 +173,18 @@ silence this project tries not to produce. strace refuses too, though it exits
   `O_RDONLY|O_CLOEXEC`.
 - **No per-call timing.** `-T` is absent, which is what blocks the
   three-generation overhead table this project exists to produce.
-- **No attaching to a running process.** `-p PID` is the next item in
-  `PLAN.md`; it was split out of the same plan item as `-e` because it is a
-  different kind of problem -- it depends on `kernel.yama.ptrace_scope`, which
-  on a machine set to 1 permits attaching only to descendants, so the feature
-  and its test both change shape with a sysctl this repo does not control.
+- **`-p` cannot attach to a non-descendant where `ptrace_scope` is 1**, which
+  is the default on Ubuntu and several other distributions. It is 0 on this
+  machine, so the suite exercises the real path here and prints a loud SKIP
+  elsewhere rather than reporting a pass it did not earn. There is no
+  workaround inside this program: the sysctl is the kernel's answer, not ours.
+- **`-p` does not detach on a signal.** Interrupting the tracer relies on the
+  kernel auto-detaching when the tracer dies, which does resume the target --
+  asserted -- but there is no handler that detaches cleanly on `SIGINT`, so
+  there is a window during which the target is stopped.
+- **`-p` attaches to one thread, not a thread group.** `strace -p` without
+  `-f` behaves the same way, but a multi-threaded target traced this way shows
+  only the thread whose pid was given.
 - **x86-64 only**, and the syscall table covers roughly 110 numbers. Anything
   outside it prints as `syscall_N`, which is honest rather than wrong.
 - **`-e` filters by name only.** strace also takes classes (`-e trace=file`,
