@@ -72,11 +72,20 @@ e=$(awk '$3 == "openat" { print $2 }' t/ours.tmp)
 if command -v strace >/dev/null 2>&1; then
   strace -c -o t/strace.tmp ./t/workload.bin >/dev/null 2>&1
 
+  # Nonzero first. write and openat have exact ground-truth assertions above,
+  # but close and fsync have none, so this differential is their only check --
+  # and it was `[ "$ours" = "$theirs" ]` with nothing else, which 0 == 0
+  # satisfies. Deleting the fsync call from t/workload.c left "ok strace
+  # agrees on fsync (0)" and a green run. The -e and -p oracles further down
+  # this same file already guard for it, in those words: "two empty outputs
+  # compare equal and prove nothing".
   for sc in write openat close fsync; do
     ours=$(count_of "$sc" t/ours.tmp)
     # strace -c puts the name last and counts in a different column order.
     theirs=$(awk -v want="$sc" '$NF == want { print $4; found=1 } END { if (!found) print 0 }' t/strace.tmp)
-    if [ "$ours" = "$theirs" ]; then
+    if [ "$ours" = 0 ] && [ "$theirs" = 0 ]; then
+      bad "strace and trace both counted zero $sc, so the comparison is vacuous"
+    elif [ "$ours" = "$theirs" ]; then
       ok "strace agrees on $sc ($ours)"
     else
       bad "strace disagrees on $sc: trace=$ours strace=$theirs"
@@ -152,9 +161,15 @@ if command -v strace >/dev/null 2>&1; then
   for sc in write clone; do
     ours=$(count_of "$sc" t/withf.tmp)
     theirs=$(awk -v want="$sc" '$NF == want { print $4; found=1 } END { if (!found) print 0 }' t/stf.tmp)
-    [ "$ours" = "$theirs" ] && ok "strace -f agrees on $sc ($ours)" \
-                            || bad "strace -f disagrees on $sc: trace=$ours strace=$theirs"
+    if [ "$ours" = 0 ] && [ "$theirs" = 0 ]; then
+      bad "strace -f and trace -f both counted zero $sc, so this is vacuous"
+    else
+      [ "$ours" = "$theirs" ] && ok "strace -f agrees on $sc ($ours)" \
+                              || bad "strace -f disagrees on $sc: trace=$ours strace=$theirs"
+    fi
   done
+else
+  printf 'SKIP strace not installed, the -f differential did not run\n'
 fi
 
 # ------------------------------------------------------------ 6. -e filtering
@@ -334,5 +349,24 @@ else
 fi
 
 rm -f t/workload.bin t/forker.bin t/looper.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp t/pfail.tmp t/pout.tmp t/spout.tmp t/lpid.tmp
+# The count is pinned. The gate was `[ "$fail" = 0 ]` alone, so every way of
+# losing assertions was a green run: making `command -v strace` fail dropped
+# 9 of 43 and still exited 0, and a nonzero kernel.yama.ptrace_scope drops the
+# 6 that are the whole point of PLAN item 09b -- including the two /proc/PID/stat
+# checks PLAN.md calls "the two that matter" -- on any default Debian or Ubuntu
+# box. Those are legitimate environment skips, so they are allowed, but they
+# have to be declared rather than absorbed: ASSERTIONS_EXPECTED is what ran
+# here, and each skip states its own cost.
+ASSERTIONS_EXPECTED=43
+total=$((pass + fail))
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
+if [ "$total" -ne "$ASSERTIONS_EXPECTED" ]; then
+  printf 'run.sh: %d assertions ran, expected %d.\n' "$total" "$ASSERTIONS_EXPECTED" >&2
+  printf '  Any SKIP lines above say what was lost and why. If a skip is\n' >&2
+  printf '  expected in this environment, subtract its cost from\n' >&2
+  printf '  ASSERTIONS_EXPECTED in the same commit that explains it:\n' >&2
+  printf '    no strace                      -9\n' >&2
+  printf '    kernel.yama.ptrace_scope != 0  -6\n' >&2
+  exit 1
+fi
 [ "$fail" = 0 ]

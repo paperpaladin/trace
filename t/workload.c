@@ -18,8 +18,9 @@ int main(void) {
     write(1, "x", 1);
   write(1, "\n", 1);          // 11
 
-  // 3 writes to stderr. One of the stdout writes above is the newline, so
-  // stdout gets 11 and stderr gets 2 for a total of 13.
+  // 2 writes to stderr. The loop above does 10 and the newline makes 11, so
+  // stdout gets 11 and stderr gets 2 for a total of 13. This said "3 writes
+  // to stderr" while the next sentence said 2 and the code did 2.
   write(2, "e", 1);           // 12
   write(2, "e", 1);           // 13
 
