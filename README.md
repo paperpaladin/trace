@@ -141,8 +141,8 @@ tutorial stops caring:
    happened.
 4. The rewritten exit path returned `WEXITSTATUS` unconditionally, which reports 0
    for a signal death. That is bug 1 again, reintroduced by the rewrite. The
-   transparency test caught it on the first run, which is the whole argument for
-   having written that test before any of the features.
+   transparency test caught it on the first run. That is the whole argument for having
+   written that test before any of the features.
 
 Neither of the first two is visible if you only ever trace programs that succeed.
 
@@ -162,18 +162,18 @@ uses because it has to pass the same list to both programs.
 
 Filtering decides what is *reported*, not what is counted, so `-c -e write`
 shows the same number for `write` that an unfiltered run does. The summary then
-shows only the calls that passed the filter, which is what `strace -c -e` does.
+shows only the calls that passed the filter, as `strace -c -e` does.
 
 An unrecognised name is refused with `invalid system call 'name'` and exit 2,
 not producing an empty filter. A typo that quietly matched nothing
-would read exactly like a program that makes no syscalls, which is the kind of
-silence this project tries not to produce. strace refuses too, though it exits
+would read exactly like a program that makes no syscalls, the kind of silence
+this project tries not to produce. strace refuses too, though it exits
 1 where this exits 2, because 2 is this program's own usage status.
 
 ### `-p`
 
-`trace -p PID` takes over a process that is already running, which is the case
-a tracer is usually wanted for: something is wedged and restarting it would
+`trace -p PID` takes over a process that is already running, the case a tracer is usually
+wanted for: something is wedged and restarting it would
 destroy the evidence.
 
 `PTRACE_SEIZE`, not `PTRACE_ATTACH`. ATTACH sends `SIGSTOP` and leaves a stop
@@ -199,7 +199,7 @@ permission problem in the ordinary sense, so the error says so.
 - Full argument decoding. Structs like `struct stat`, `iovec` and
   `sockaddr` print as hex pointers. Open flags print as a number, not as
   `O_RDONLY|O_CLOEXEC`.
-- No per-call timing. `-T` is absent, which is what blocks the
+- No per-call timing. `-T` is absent, and its absence blocks the
   three-generation overhead table this project exists to produce.
 - `-p` cannot attach to a non-descendant where `ptrace_scope` is 1, which
   is the default on Ubuntu and several other distributions. It is 0 on this
