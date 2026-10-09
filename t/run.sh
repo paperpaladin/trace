@@ -237,6 +237,96 @@ if command -v strace >/dev/null 2>&1; then
                    || bad "strace -e reported $srows rows; the oracle is not comparable"
 fi
 
-rm -f t/workload.bin t/forker.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp
+# ----------------------------------------------------- 7. -p attaching
+
+# Argument handling first; it needs no target and cannot hang.
+./trace -p 0 >/dev/null 2>&1
+[ $? = 2 ] && ok "-p rejects pid 0" || bad "-p accepted pid 0"
+./trace -p notanumber >/dev/null 2>&1
+[ $? = 2 ] && ok "-p rejects a non-numeric pid" || bad "-p accepted a non-numeric pid"
+./trace -p 1 /bin/true >/dev/null 2>&1
+[ $? = 2 ] && ok "-p with a command is refused" || bad "-p accepted both a pid and a command"
+
+# An unattachable pid must fail with a message, not hang waiting for a stop
+# that will never come. Pid 1 is init: attaching to it needs privileges we do
+# not have, which makes it a reliably unattachable live process.
+timeout 10 ./trace -p 1 >/dev/null 2>t/pfail.tmp
+rc=$?
+if [ "$rc" = 124 ]; then
+  bad "-p on an unattachable pid hung instead of failing"
+elif [ "$rc" = 0 ]; then
+  printf 'SKIP -p on pid 1 succeeded, so this process has more privilege than assumed\n'
+elif grep -q 'cannot attach to 1' t/pfail.tmp; then
+  ok "-p on an unattachable pid fails and says so"
+else
+  bad "-p on an unattachable pid failed without explaining" "$(head -2 t/pfail.tmp)"
+fi
+
+# The real thing needs a process that is already running and making a known
+# syscall. ptrace_scope 1 permits attaching only to descendants, and the
+# target below is a sibling, so on such a machine this is skipped rather than
+# failed -- the kernel is the authority and it is entitled to say no.
+scope=0
+[ -r /proc/sys/kernel/yama/ptrace_scope ] && scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
+
+cc -O1 -static -o t/looper.bin t/looper.c 2>/dev/null || {
+  echo "cannot build t/looper.c"; exit 1; }
+
+if [ "$scope" != 0 ]; then
+  printf 'SKIP -p: kernel.yama.ptrace_scope is %s, which forbids attaching to a sibling\n' "$scope"
+else
+  t/looper.bin > t/lpid.tmp 2>/dev/null &
+  looper=$!
+  # Wait for it to print its pid, rather than sleeping a guessed interval.
+  i=0
+  while [ ! -s t/lpid.tmp ] && [ $i -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
+  target=$(cat t/lpid.tmp 2>/dev/null)
+
+  if [ -z "$target" ]; then
+    bad "-p: the looper never reported its pid"
+  else
+    timeout 5 ./trace -e write -p "$target" >/dev/null 2>t/pout.tmp
+    n=$(grep -c '^write(' t/pout.tmp)
+    [ "$n" -gt 0 ] && ok "-p: traced $n write calls in an already-running process" \
+                   || bad "-p: saw no write calls" "$(head -3 t/pout.tmp)"
+    grep -q "attached to $target" t/pout.tmp \
+      && ok "-p: reports which pid it attached to" \
+      || bad "-p: did not report the attach"
+
+    # The assertion this feature exists to satisfy. A process we attached to is
+    # not ours: when the tracer goes away the target must still be running.
+    # Getting the detach wrong leaves it stopped forever, and "stopped forever"
+    # looks exactly like "alive" to kill -0, so the state has to be read.
+    if kill -0 "$target" 2>/dev/null; then
+      ok "-p: the target is still alive after the tracer exits"
+    else
+      bad "-p: the target died when the tracer exited"
+    fi
+    st=$(awk '{print $3}' /proc/"$target"/stat 2>/dev/null)
+    case "$st" in
+      T|t) bad "-p: the target was left stopped (state $st), not resumed" ;;
+      "")  bad "-p: the target is gone, so its state cannot be read" ;;
+      *)   ok "-p: the target was resumed, not left stopped (state $st)" ;;
+    esac
+
+    # The oracle: strace attaching to the same kind of target must also see
+    # writes. Checked for nonzero first, because two empty outputs agree.
+    if command -v strace >/dev/null 2>&1; then
+      timeout 5 strace -e trace=write -p "$target" -o t/spout.tmp >/dev/null 2>&1
+      sn=$(grep -c '^write(' t/spout.tmp 2>/dev/null || echo 0)
+      [ "$sn" -gt 0 ] && ok "strace -p also sees writes in it ($sn)" \
+                      || bad "strace -p saw none, so the comparison is vacuous"
+    fi
+
+    # And it still exits on its own terms, with its own status.
+    kill -TERM "$target" 2>/dev/null
+    wait "$looper" 2>/dev/null
+    lrc=$?
+    [ "$lrc" = 0 ] && ok "-p: the target exits with its own status after all that" \
+                   || bad "-p: the target exited $lrc, want 0"
+  fi
+fi
+
+rm -f t/workload.bin t/forker.bin t/looper.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp t/pfail.tmp t/pout.tmp t/spout.tmp t/lpid.tmp
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
