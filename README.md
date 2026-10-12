@@ -20,23 +20,51 @@ ok   decodes openat path argument
 ok   decodes -errno into a name
 ok   escapes newline in a path
 ok   stdout unchanged under -f
+ok   exit status unchanged under -f
 ok   without -f sees only the parent's write
 ok   with -f sees all 4 writes
 ok   counts 3 clones
+ok   announces 3 new processes
 ok   strace -f agrees on write (4)
 ok   strace -f agrees on clone (3)
+ok   -e write: count unchanged by filtering (13)
+ok   -e write: summary has only write and total
+ok   -e trace=write is the same as -e write
+ok   -e write: every line is a complete write call (13 of them)
+ok   -e write,close: both appear and nothing else
+ok   -e with an unknown name exits 2
+ok   -e names the syscall it did not recognise
+ok   -e does not change the traced program
+ok   strace -e trace=write agrees on write (13)
+ok   strace -e also reports a single syscall row
+ok   -p rejects pid 0
+ok   -p rejects a non-numeric pid
+ok   -p with a command is refused
+ok   -p on an unattachable pid fails and says so
+ok   -p: traced 2137 write calls in an already-running process
+ok   -p: reports which pid it attached to
+ok   -p: the target is still alive after the tracer exits
+ok   -p: the target was resumed, not left stopped (state S)
+ok   strace -p also sees writes in it (2831)
+ok   -p: the target exits with its own status after all that
 
 43 passed, 0 failed
 ```
 
 ```
-$ ./trace -c ls >/dev/null
+$ ./trace -c ls >/dev/null          # GNU coreutils 9.7 on this machine
    calls   errors syscall
-      17        0 mmap
-      10        1 openat
-       8        0 newfstatat
+      23        0 mmap
+      11        0 close
+      10        0 fstat
+       9        0 openat
        ...
 ```
+
+The exact rows depend on the `ls` and the libc in front of you -- this one
+reaches `fstat` where a different build reaches `newfstatat`, and the counts
+move with the directory being listed. It is pasted as an illustration of the
+format, not as a number to match.
 
 ## Why three generations
 
