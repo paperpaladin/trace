@@ -313,7 +313,13 @@ else
     # writes. Checked for nonzero first, because two empty outputs agree.
     if command -v strace >/dev/null 2>&1; then
       timeout 5 strace -e trace=write -p "$target" -o t/spout.tmp >/dev/null 2>&1
-      sn=$(grep -c '^write(' t/spout.tmp 2>/dev/null || echo 0)
+      # `grep -c ... || echo 0` is wrong in a way that looks right: grep -c
+      # prints 0 AND exits 1 when nothing matches, so the `||` appends a
+      # second zero, sn becomes "0\n0", and `[ -gt ]` is an
+      # integer-expression error rather than a comparison. It lands in the
+      # bad branch, which is the intended direction, by accident. The same
+      # spelling was found in prof and fixed there.
+      sn=$(grep -c '^write(' t/spout.tmp 2>/dev/null); sn=${sn:-0}
       [ "$sn" -gt 0 ] && ok "strace -p also sees writes in it ($sn)" \
                       || bad "strace -p saw none, so the comparison is vacuous"
     fi
