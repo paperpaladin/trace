@@ -2,7 +2,9 @@
 
 ## Contract
 
-`trace [-c] CMD [ARGS...]`. Per-call output on stderr, or a summary with `-c`.
+`trace [-c] [-f] [-e name,name] CMD [ARGS...]` or `trace [-c] -p PID`.
+Per-call output on stderr, or a summary with `-c`; `-f` follows children and
+`-e` filters by name. All four are shipped -- this line listed only `-c`.
 Exit status is the **traced program's** status, so `trace` is transparent in a
 pipeline.
 
@@ -27,9 +29,13 @@ output.
 
 ## Non-goals (for generation one)
 
-Full struct decoding. Attaching to a running pid. Any architecture but x86-64. Those belong to a tracer people use; this one exists to
-be the slow, complete baseline that generations two and three are measured
-against.
+Full struct decoding. Any architecture but x86-64. Those belong to a tracer
+people use; this one exists to be the slow, complete baseline that generations
+two and three are measured against.
+
+Attaching to a running pid was on this list and then shipped as item 09b, so
+it has been removed from it. The Non-goals section is for what the project
+declines to do, not a record of what it once declined.
 
 ## Commit sequence
 
@@ -106,20 +112,20 @@ against.
 
 ### Milestone 2 -- generation two: seccomp user notification
 
-- [ ] 12 the same tracer on `SECCOMP_USER_NOTIF`, with a filter that only
+- [ ] 13 the same tracer on `SECCOMP_USER_NOTIF`, with a filter that only
       notifies on the syscalls we care about
-- [ ] 13 demonstrate the capability `ptrace` has and eBPF does not: intercept an
+- [ ] 14 demonstrate the capability `ptrace` has and eBPF does not: intercept an
       `openat` and substitute a different return value
       why: this is the concrete difference that makes the comparison table worth
            publishing rather than obvious
 
 ### Milestone 3 -- generation three: eBPF
 
-- [ ] 14 the same tracer on raw tracepoints with CO-RE, needs clang + libbpf
-- [ ] 15 show what it *cannot* do: eBPF observes, it cannot block or modify
-- [ ] 16 the overhead harness: a workload issuing N million syscalls, measured
+- [ ] 15 the same tracer on raw tracepoints with CO-RE, needs clang + libbpf
+- [ ] 16 show what it *cannot* do: eBPF observes, it cannot block or modify
+- [ ] 17 the overhead harness: a workload issuing N million syscalls, measured
       under all three tracers plus untraced, with variance reported
-- [ ] 17 the write-up and the capability table, with real numbers
+- [ ] 18 the write-up and the capability table, with real numbers
 
 ## Open questions
 

@@ -213,7 +213,7 @@ permission problem in the ordinary sense, so the error says so.
 - **`-p` attaches to one thread, not a thread group.** `strace -p` without
   `-f` behaves the same way, but a multi-threaded target traced this way shows
   only the thread whose pid was given.
-- **x86-64 only**, and the syscall table covers roughly 110 numbers. Anything
+- **x86-64 only**, and the syscall table covers 121 numbers. Anything
   outside it prints as `syscall_N`, which is honest rather than wrong.
 - **`-e` filters by name only.** strace also takes classes (`-e trace=file`,
   `%net`), negation (`-e trace=!write`), and `-e` qualifiers other than
