@@ -69,7 +69,7 @@ declines to do, not a record of what it once declined.
 - [x] 09 `-e name,name` filtering
       why: the first thing anyone reaches for on a tracer whose output is
       thousands of lines long, and the cheapest useful feature left.
-      done: also accepts strace's `-e trace=name,name` spelling, which is what
+      done: also accepts strace's `-e trace=name,name` spelling, the thing
       the harness passes to both programs so the differential compares the
       same request. Filtering applies to reporting, not counting, so a
       filtered count equals an unfiltered one and the summary then shows only
@@ -106,7 +106,7 @@ declines to do, not a record of what it once declined.
       turns exactly those red.
 - [ ] 10 decode the argument structs that matter: `struct stat`, `iovec`,
       `sockaddr`, open flags as symbolic names
-- [ ] 11 `-T` per-call timing, which is the prerequisite for the overhead table
+- [ ] 11 `-T` per-call timing, the prerequisite for the overhead table
 - [ ] 12 `PTRACE_O_TRACEEXEC`, so an exec inside a followed child is visible as an
       event, not only as a syscall
 
