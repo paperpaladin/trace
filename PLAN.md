@@ -104,8 +104,31 @@ declines to do, not a record of what it once declined.
       must still exist and must not be in state T, since a process stopped
       forever looks alive to kill -0. Adding EXITKILL to the attach options
       turns exactly those red.
-- [ ] 10 decode the argument structs that matter: `struct stat`, `iovec`,
+- [x] 10 decode the argument structs that matter: `struct stat`, `iovec`,
       `sockaddr`, open flags as symbolic names
+      done: 19 new assertions, 62 in the suite. `struct stat` for stat,
+      lstat, fstat and newfstatat, read on the EXIT stop because the kernel
+      fills it in, which is why each tracee now keeps the arguments it saw
+      on entry. The iovec array of writev, the sockaddr of connect and bind,
+      and open flags and mode as names. The oracle is strace -v on a shared
+      fixture in a shared scratch directory, so st_ino and the paths are the
+      same facts and not just the same shape, and the comparison extracts
+      named fields rather than matching lines: st_atime/mtime/ctime are
+      excluded as clocks, st_dev because strace prints the minor in hex, and
+      the returned fd because the kernel picks it. Everything else is
+      compared.
+      The fixture is awkward on purpose, since a zeroed struct and a
+      one-element array decode correctly under a wrong implementation:
+      mode 0751, size 4919, iovecs of 5/7/11, 127.0.0.42:9999, a symlink so
+      S_IFLNK is reached, and a path whose owner and group differ, without
+      which a decoder that swaps st_uid and st_gid passes everything.
+      Two bugs the oracle found: a setgid file printed as S_IFREG|02755
+      where strace says S_IFREG|S_ISGID|0755, and AT_FDCWD compared as a
+      64-bit word, which is right for glibc's sign-extended -100 and wrong
+      for the 0xffffff9c that syscall(2) passes. 13 of 16 mutations died on
+      the first run; the sockaddr over-read needed a fixture with a sockaddr
+      at the end of a mapping before it would, and a stat read eight bytes
+      short is equivalent and written down in the README.
 - [ ] 11 `-T` per-call timing, the prerequisite for the overhead table
 - [ ] 12 `PTRACE_O_TRACEEXEC`, so an exec inside a followed child is visible as an
       event, not only as a syscall
