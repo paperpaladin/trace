@@ -187,7 +187,7 @@ not set when attaching. For our own child it means "do not leave an orphan
 stopped forever if the tracer dies". For a process that was running before we
 arrived, it would mean killing someone else's program because we exited, which
 is the worst thing this program could do. The suite asserts the difference by
-reading `/proc/PID/stat` after the tracer is gone. The target must still exist
+reading `/proc/PID/stat` after the tracer is gone. A target must still exist
 *and* must not be in state `T`, because a process stopped forever looks alive
 to `kill -0`.
 
