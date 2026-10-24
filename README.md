@@ -197,8 +197,7 @@ permission problem in the ordinary sense, so the error says so.
 ### What does not work
 
 - Full argument decoding. Structs like `struct stat`, `iovec` and
-  `sockaddr` print as hex pointers. Open flags print as a number, not as
-  `O_RDONLY|O_CLOEXEC`.
+  `sockaddr` print as hex pointers. Open flags print as a number, never as `O_RDONLY|O_CLOEXEC`.
 - No per-call timing. `-T` is absent, and its absence blocks the
   three-generation overhead table this project exists to produce.
 - `-p` cannot attach to a non-descendant where `ptrace_scope` is 1, which
@@ -210,7 +209,7 @@ permission problem in the ordinary sense, so the error says so.
   kernel auto-detaching when the tracer dies, which does resume the target:
   asserted, but there is no handler that detaches cleanly on `SIGINT`, so
   there is a window during which the target is stopped.
-- `-p` attaches to one thread, not a thread group. `strace -p` without
+- `-p` attaches to one thread and never a thread group. `strace -p` without
   `-f` behaves the same way, but a multi-threaded target traced this way shows
   only the thread whose pid was given.
 - x86-64 only, and the syscall table covers 121 numbers. Anything
