@@ -348,7 +348,200 @@ else
   fi
 fi
 
-rm -f t/workload.bin t/forker.bin t/looper.bin t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp t/pfail.tmp t/pout.tmp t/spout.tmp t/lpid.tmp
+# ------------------------------------------------- 8. argument struct decoding
+
+# PLAN item 10. The fixture's values are deliberately odd (mode 0751, size
+# 4919, three iovecs of 5/7/11 bytes, 127.0.0.42:9999) because a struct of
+# zeroes and a one-element array decode correctly under almost any
+# implementation, including a wrong one.
+#
+# How the comparison is normalised: strace's output format is its own and will
+# never match ours character for character, so nothing is compared as a line.
+# Each fact is extracted by name from the line that carries it -- `st_size=`
+# from the fstat line, every `iov_len=` from the writev line -- and the
+# extracted values are compared. Flag sets are sorted before comparing, so the
+# comparison is of the set of names and not of strace's ordering. Three classes
+# of field are excluded and each exclusion is a thing we cannot compare rather
+# than a thing we chose not to: st_atime/st_mtime/st_ctime, which are clocks
+# read twice at two different times; st_dev, where strace prints the minor
+# number in hex and we print it in decimal; and the fd a call returns, which is
+# the kernel's to choose. Everything else is compared, so a decoder reading one
+# field from the wrong offset fails.
+#
+# strace is given -v because without it strace abbreviates the struct to
+# st_mode and st_size and the other six fields never appear on either side,
+# which would be a comparison that passes whatever we print for them.
+
+D=t/tmp.$$
+mkdir -p "$D" || exit 1
+
+# A path whose owner and group are different numbers, so that printing st_uid
+# and st_gid the other way round is a visible error rather than a harmless one.
+# This cannot be arranged on our own file: fchown into a supplementary group
+# returns EPERM in the container this was written in.
+gidfile=
+for p in /usr/bin/expiry /usr/bin/wall /usr/bin/write /usr/bin/crontab \
+         /usr/bin/chage /var/log/lastlog /dev/ptmx /dev/tty; do
+  [ -e "$p" ] || continue
+  pu=$(stat -Lc '%u' "$p" 2>/dev/null); pg=$(stat -Lc '%g' "$p" 2>/dev/null)
+  [ -n "$pu" ] && [ "$pu" != "$pg" ] && { gidfile=$p; break; }
+done
+cc -O1 -static -o t/structs.bin t/structs.c 2>/dev/null || {
+  echo "cannot build t/structs.c"; exit 1; }
+
+# Transparency, again, with the new decoding switched on. Every struct printed
+# below is read out of the tracee's memory while it is stopped, which is the
+# most intrusive thing this program does.
+s_untraced=$(./t/structs.bin "$D" "$gidfile" 2>/dev/null); s_urc=$?
+s_traced=$(./trace ./t/structs.bin "$D" "$gidfile" 2>/dev/null); s_trc=$?
+[ "$s_untraced" = "$s_traced" ] && [ -n "$s_untraced" ] \
+  && ok "struct decoding: stdout unchanged (and not empty)" \
+  || bad "struct decoding changed stdout: '$s_untraced' vs '$s_traced'"
+[ "$s_urc" = "$s_trc" ] \
+  && ok "struct decoding: exit status unchanged ($s_trc)" \
+  || bad "struct decoding changed exit status: $s_urc vs $s_trc"
+
+./trace ./t/structs.bin "$D" "$gidfile" >/dev/null 2>t/dec.tmp
+
+# field <file> <line-pattern> <name>...  ->  " name=value name=value"
+# Reads the named fields off the first line matching the pattern. Order of the
+# output is ours, not the tracer's, which is what makes the two comparable.
+field() {
+  _f=$1; _pat=$2; shift 2
+  _out=
+  for _k in "$@"; do
+    _v=$(sed -n "/$_pat/{s/.*[{, ]$_k=\([^,}]*\).*/\1/p;q}" "$_f")
+    _out="$_out $_k=$_v"
+  done
+  printf '%s\n' "$_out"
+}
+# A flag set compared as a set: sorted, so strace's ordering is not an input.
+sortflags() { tr '|' '\n' | sort | tr '\n' '|'; }
+line_of() { sed -n "/$2/{p;q}" "$1"; }
+agree() {   # agree <what> <ours> <theirs>
+  if [ -z "$2" ] || [ -z "$3" ]; then
+    bad "$1: nothing extracted (trace='$2' strace='$3'), so the comparison is vacuous"
+  elif [ "$2" = "$3" ]; then
+    ok "strace agrees on $1"
+  else
+    bad "strace disagrees on $1:" "  trace : $2" "  strace: $3"
+  fi
+}
+
+STATF="st_ino st_mode st_nlink st_uid st_gid st_blksize st_blocks st_size"
+
+# Ground truth first: the fixture passed these exact values, so a decoder that
+# agrees with strace about the wrong thing still has to get past this.
+oflags=$(line_of t/dec.tmp '^openat(.*stat\.tmp' | sed -n 's/.*", \(O_[^,)]*\).*/\1/p')
+omode=$(line_of t/dec.tmp '^openat(.*stat\.tmp' | sed -n 's/.*, \(0[0-7]*\)) = .*/\1/p')
+[ "$oflags" = "O_WRONLY|O_CREAT|O_TRUNC|O_APPEND|O_CLOEXEC" ] && [ "$omode" = "0751" ] \
+  && ok "open flags decode to names ($oflags, $omode)" \
+  || bad "open flags wrong: flags='$oflags' mode='$omode'"
+
+fstat_ours=$(field t/dec.tmp '^fstat(' $STATF)
+case "$fstat_ours" in
+  *"st_mode=S_IFREG|0751"*) case "$fstat_ours" in
+      *"st_size=4919"*) ok "struct stat: the fixture's own mode and size ($fstat_ours)" ;;
+      *) bad "struct stat: st_size is not 4919:$fstat_ours" ;;
+    esac ;;
+  *) bad "struct stat: st_mode is not S_IFREG|0751:$fstat_ours" ;;
+esac
+
+# The third stat, on the owner != group path. Without it the fstat above has
+# st_uid == st_gid and a decoder that swaps the two passes everything.
+stat3_ours=$(field t/dec.tmp '^stat(' $STATF)
+du=$(printf '%s' "$stat3_ours" | sed -n 's/.*st_uid=\([0-9]*\).*/\1/p')
+dg=$(printf '%s' "$stat3_ours" | sed -n 's/.*st_gid=\([0-9]*\).*/\1/p')
+if [ -z "$gidfile" ]; then
+  printf 'SKIP no readable path here has an owner and a group that differ, so an st_uid/st_gid swap cannot be seen\n'
+elif [ -n "$du" ] && [ "$du" != "$dg" ]; then
+  ok "stat($gidfile): st_uid ($du) and st_gid ($dg) differ, so swapping them is visible"
+else
+  bad "stat($gidfile) should have had differing uid/gid:$stat3_ours"
+fi
+
+# The symlink is the case that catches a decoder with S_IFREG written into it,
+# and its size is the length of the target rather than a block count.
+lstat_ours=$(field t/dec.tmp '^newfstatat(' $STATF)
+case "$lstat_ours" in
+  *"st_mode=S_IFLNK|0777"*"st_size=19"*) ok "struct stat: a symlink is S_IFLNK and 19 bytes" ;;
+  *) bad "struct stat on the symlink is wrong:$lstat_ours" ;;
+esac
+
+iov_ours=$(line_of t/dec.tmp '^writev(' | grep -o 'iov_len=[0-9]*' | tr '\n' ' ')
+iob_ours=$(line_of t/dec.tmp '^writev(' | grep -o 'iov_base="[^"]*"' | tr '\n' ' ')
+[ "$iov_ours" = "iov_len=5 iov_len=7 iov_len=11 " ] \
+  && [ "$iob_ours" = 'iov_base="abcde" iov_base="fghijkl" iov_base="mnopqrstuvw" ' ] \
+  && ok "iovec: all 3 elements, distinct lengths 5/7/11" \
+  || bad "iovec wrong: lens='$iov_ours' bases='$iob_ours'"
+
+in_ours=$(field t/dec.tmp '^connect(.*AF_INET,' sa_family sin_port sin_addr)
+un_ours=$(field t/dec.tmp '^connect(.*AF_UNIX' sa_family sun_path)
+case "$in_ours" in
+  *'sin_port=htons(9999)'*'sin_addr=inet_addr("127.0.0.42")'*)
+    ok "sockaddr_in: port and address survive the byte order" ;;
+  *) bad "sockaddr_in wrong:$in_ours" ;;
+esac
+edge_ours=$(field t/dec.tmp 'htons(7777)' sa_family sin_port sin_addr)
+case "$edge_ours" in
+  *'sin_port=htons(7777)'*'sin_addr=inet_addr("127.0.0.23")'*)
+    ok "sockaddr: one 16 bytes before the end of a mapping still decodes" ;;
+  *) bad "sockaddr at the end of a mapping was not decoded:$edge_ours" \
+         "$(line_of t/dec.tmp '^connect(.*, 16) = ' | tail -1)" ;;
+esac
+
+case "$un_ours" in
+  *"nosock.tmp"*) ok "sockaddr_un: the path is decoded" ;;
+  *) bad "sockaddr_un wrong:$un_ours" ;;
+esac
+
+# The oracle. Same fixture, same scratch directory, so st_ino and the paths are
+# the same facts in both runs and not just the same shape.
+if command -v strace >/dev/null 2>&1; then
+  strace -v -o t/sdec.tmp ./t/structs.bin "$D" "$gidfile" >/dev/null 2>&1
+
+  sflags=$(line_of t/sdec.tmp '^openat(.*stat\.tmp' | sed -n 's/.*", \(O_[^,)]*\).*/\1/p')
+  smode=$(line_of t/sdec.tmp '^openat(.*stat\.tmp' | sed -n 's/.*, \(0[0-7]*\)) = .*/\1/p')
+  agree "openat flags and mode" \
+        "$(printf '%s' "$oflags" | sortflags) $omode" \
+        "$(printf '%s' "$sflags" | sortflags) $smode"
+
+  agree "every field of struct stat from fstat" \
+        "$fstat_ours" "$(field t/sdec.tmp '^fstat(' $STATF)"
+
+  [ -n "$gidfile" ] && agree "every field of struct stat from stat($gidfile)" \
+        "$stat3_ours" "$(field t/sdec.tmp '^stat(' $STATF)"
+
+  agree "every field of struct stat from newfstatat on a symlink" \
+        "$lstat_ours" "$(field t/sdec.tmp '^newfstatat(' $STATF)"
+
+  # The AT_ flag is an argument after the struct, so it is also the check that
+  # the struct did not swallow the rest of the argument list.
+  ours_at=$(line_of t/dec.tmp '^newfstatat(' | sed -n 's/.*}, \([A-Z_|]*\)) = .*/\1/p')
+  theirs_at=$(line_of t/sdec.tmp '^newfstatat(' | sed -n 's/.*}, \([A-Z_|]*\)) = .*/\1/p')
+  agree "the flags argument after the struct" "$ours_at" "$theirs_at"
+
+  # The dirfd, which is an int in a 64-bit register. A tracer that compares the
+  # whole word against AT_FDCWD agrees with strace on everything glibc passes
+  # and disagrees the moment something calls syscall(2) directly, which is what
+  # the fixture's newfstatat does. That was a real bug in this decoder.
+  agree "the dirfd argument" \
+        "$(line_of t/dec.tmp '^newfstatat(' | sed -n 's/^newfstatat(\([^,]*\),.*/\1/p')" \
+        "$(line_of t/sdec.tmp '^newfstatat(' | sed -n 's/^newfstatat(\([^,]*\),.*/\1/p')"
+
+  sw=$(line_of t/sdec.tmp '^writev(')
+  agree "the whole iovec array" \
+        "$iov_ours$iob_ours" \
+        "$(printf '%s' "$sw" | grep -o 'iov_len=[0-9]*' | tr '\n' ' ')$(printf '%s' "$sw" | grep -o 'iov_base="[^"]*"' | tr '\n' ' ')"
+
+  agree "sockaddr_in" "$in_ours" "$(field t/sdec.tmp '^connect(.*AF_INET,' sa_family sin_port sin_addr)"
+  agree "sockaddr_un" "$un_ours" "$(field t/sdec.tmp '^connect(.*AF_UNIX' sa_family sun_path)"
+else
+  printf 'SKIP strace not installed, the struct-decoding differential did not run\n'
+fi
+rm -rf "$D"
+
+rm -f t/workload.bin t/forker.bin t/looper.bin t/structs.bin t/dec.tmp t/sdec.tmp t/ours.tmp t/strace.tmp t/calls.tmp t/esc.tmp t/nof.tmp t/withf.tmp t/stf.tmp t/ef.tmp t/ef2.tmp t/ec.tmp t/ec2.tmp t/ebad.tmp t/sef.tmp t/pfail.tmp t/pout.tmp t/spout.tmp t/lpid.tmp
 # The count is pinned. The gate was `[ "$fail" = 0 ]` alone, so every way of
 # losing assertions was a green run: making `command -v strace` fail dropped
 # 9 of 43 and still exited 0, and a nonzero kernel.yama.ptrace_scope drops the
@@ -357,7 +550,7 @@ rm -f t/workload.bin t/forker.bin t/looper.bin t/ours.tmp t/strace.tmp t/calls.t
 # box. Those are legitimate environment skips, so they are allowed, but they
 # have to be declared rather than absorbed: ASSERTIONS_EXPECTED is what ran
 # here, and each skip states its own cost.
-ASSERTIONS_EXPECTED=43
+ASSERTIONS_EXPECTED=62
 total=$((pass + fail))
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if [ "$total" -ne "$ASSERTIONS_EXPECTED" ]; then
@@ -365,8 +558,9 @@ if [ "$total" -ne "$ASSERTIONS_EXPECTED" ]; then
   printf '  Any SKIP lines above say what was lost and why. If a skip is\n' >&2
   printf '  expected in this environment, subtract its cost from\n' >&2
   printf '  ASSERTIONS_EXPECTED in the same commit that explains it:\n' >&2
-  printf '    no strace                      -9\n' >&2
+  printf '    no strace                      -18\n' >&2
   printf '    kernel.yama.ptrace_scope != 0  -6\n' >&2
+  printf '    no owner != group path         -2\n' >&2
   exit 1
 fi
 [ "$fail" = 0 ]

@@ -41,14 +41,33 @@ ok   -p rejects pid 0
 ok   -p rejects a non-numeric pid
 ok   -p with a command is refused
 ok   -p on an unattachable pid fails and says so
-ok   -p: traced 2137 write calls in an already-running process
+ok   -p: traced 3299 write calls in an already-running process
 ok   -p: reports which pid it attached to
 ok   -p: the target is still alive after the tracer exits
 ok   -p: the target was resumed, not left stopped (state S)
-ok   strace -p also sees writes in it (2831)
+ok   strace -p also sees writes in it (3410)
 ok   -p: the target exits with its own status after all that
+ok   struct decoding: stdout unchanged (and not empty)
+ok   struct decoding: exit status unchanged (0)
+ok   open flags decode to names (O_WRONLY|O_CREAT|O_TRUNC|O_APPEND|O_CLOEXEC, 0751)
+ok   struct stat: the fixture's own mode and size ( st_ino=9343984 st_mode=S_IFREG|0751 st_nlink=1 st_uid=1000 st_gid=1000 st_blksize=4096 st_blocks=16 st_size=4919)
+ok   stat(/usr/bin/expiry): st_uid (0) and st_gid (42) differ, so swapping them is visible
+ok   struct stat: a symlink is S_IFLNK and 19 bytes
+ok   iovec: all 3 elements, distinct lengths 5/7/11
+ok   sockaddr_in: port and address survive the byte order
+ok   sockaddr: one 16 bytes before the end of a mapping still decodes
+ok   sockaddr_un: the path is decoded
+ok   strace agrees on openat flags and mode
+ok   strace agrees on every field of struct stat from fstat
+ok   strace agrees on every field of struct stat from stat(/usr/bin/expiry)
+ok   strace agrees on every field of struct stat from newfstatat on a symlink
+ok   strace agrees on the flags argument after the struct
+ok   strace agrees on the dirfd argument
+ok   strace agrees on the whole iovec array
+ok   strace agrees on sockaddr_in
+ok   strace agrees on sockaddr_un
 
-43 passed, 0 failed
+62 passed, 0 failed
 ```
 
 ```
@@ -151,6 +170,7 @@ Neither of the first two is visible if you only ever trace programs that succeed
 Works. Decodes syscall names from a sparse x86-64 table, path arguments for the
 `open`/`stat`/`unlink` families, and `-errno` returns into names. Paths are escaped
 on output, so a filename containing a newline cannot forge a line of trace output.
+Decodes `struct stat`, `struct iovec` arrays, `struct sockaddr` and open flags.
 Follows children with `-f`. Filters by name with `-e`. Attaches to a running
 process with `-p`.
 
@@ -194,10 +214,123 @@ to `kill -0`.
 `EPERM` on attach is usually `kernel.yama.ptrace_scope`, not a
 permission problem in the ordinary sense, so the error says so.
 
+### Argument structs
+
+```
+openat(AT_FDCWD, "t/tmp.9371/stat.tmp", O_WRONLY|O_CREAT|O_TRUNC|O_APPEND|O_CLOEXEC, 0751) = 3
+fstat(3, {st_dev=makedev(0, 50), st_ino=9318667, st_mode=S_IFREG|0751, st_nlink=1,
+          st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=16, st_size=4919}) = 0
+writev(1, [{iov_base="abcde", iov_len=5}, {iov_base="fghijkl", iov_len=7},
+           {iov_base="mnopqrstuvw", iov_len=11}], 3) = 23
+connect(4, {sa_family=AF_INET, sin_port=htons(9999),
+            sin_addr=inet_addr("127.0.0.42")}, 16) = -1 Connection refused
+connect(4, {sa_family=AF_UNIX, sun_path="t/tmp.9371/nosock.tmp"}, 110) = -1 No such file or directory
+```
+
+`struct stat` is filled in by the kernel, so it does not exist on the entry
+stop and is read on the exit stop instead, which is why the entry half now
+keeps the arguments it saw. A failed call wrote nothing, so a failed `fstat`
+prints the pointer rather than a struct of whatever happened to be there.
+
+#### How the differential is normalised
+
+strace's output format is its own and will not match ours character for
+character, so `t/run.sh` compares no line as a line. Each fact is pulled out
+by name from the line that carries it, `st_size=` off the `fstat` line, every
+`iov_len=` off the `writev` line, and the values are compared. Flag sets are
+sorted first, so what is compared is the set of names and not strace's
+ordering of them.
+
+Three classes of field are left out, and each is something that cannot be
+compared rather than something we chose not to check:
+
+- `st_atime`, `st_mtime`, `st_ctime`. Clocks, read by two processes at two
+  different times. We do not print them at all.
+- `st_dev`. strace prints the minor number in hex, we print it in decimal.
+- The fd a call returns. The kernel picks it and the two runs need not agree.
+
+Everything else is compared, so a decoder reading one field from the wrong
+offset fails. strace is run with `-v`, because without it strace abbreviates
+the struct to `st_mode` and `st_size` and the other six fields would be absent
+from both sides, which is a comparison that passes whatever we print.
+
+Both tracers run the same fixture in the same scratch directory, so `st_ino`
+and the paths are the same facts in both runs and not merely the same shape.
+
+#### The fixture is deliberately awkward
+
+A `struct stat` of zeroes and a one-element `iovec` array decode correctly
+under almost any implementation, including a wrong one, so `t/structs.c` uses
+mode 0751, size 4919, three iovecs of 5, 7 and 11 bytes, and 127.0.0.42:9999,
+where every byte of the address and both bytes of the port differ. It stats a
+symlink as well as a regular file, so a decoder with `S_IFREG` written into it
+fails, and it stats a path chosen by the harness for having an owner and a
+group that are different numbers, because while `st_uid == st_gid` a decoder
+that prints the two the other way round passes everything.
+
+One `sockaddr` sits 16 bytes before the end of a mapping with nothing after
+it. A tracer that reads `sizeof(struct sockaddr_storage)` instead of the
+`addrlen` it was given runs off the end of the mapping, decodes nothing, and
+prints a pointer. That was a surviving mutation before the fixture had that
+case.
+
+#### What the oracle caught
+
+Two things, neither of which looked wrong in isolation.
+
+`/usr/bin/expiry` is setgid. We printed `st_mode=S_IFREG|02755`, folding the
+bit into the octal, where strace prints `S_IFREG|S_ISGID|0755`. The suite had
+agreed about every other file because no other file in the fixture has a
+special bit set.
+
+A dirfd is an `int`, and `AT_FDCWD` arrives in a 64-bit register as
+`0xffffff9c` when the caller used `syscall(2)` directly rather than glibc's
+wrapper, which sign-extends. Comparing the whole word against -100 therefore
+printed `AT_FDCWD` for everything glibc issues and `4294967196` for everything
+else. The mutation that reintroduces it survived the first mutation run,
+because nothing compared the dirfd; the suite compares it now.
+
 ### What does not work
 
-- Full argument decoding. Structs like `struct stat`, `iovec` and
-  `sockaddr` print as hex pointers. Open flags print as a number, never as `O_RDONLY|O_CLOEXEC`.
+- Argument decoding is a list of cases, not a table, and the list is short.
+  Decoded: `open`/`openat` flags and mode, `struct stat` for `stat`, `lstat`,
+  `fstat` and `newfstatat`, the `iovec` array of `writev`, and `struct
+  sockaddr` for `connect` and `bind`. Everything else still prints its first
+  three arguments as hex.
+- `readv` prints its `iovec` pointer and not the array. The buffers are
+  filled in by the kernel, so the entry stop has nothing in them and the
+  array would have to be read again on the exit stop, as `struct stat` is.
+  Same for `recvfrom`, and for `accept`, `getsockname` and `getpeername`,
+  whose `sockaddr` is an output argument.
+- `sendmsg` and `recvmsg` print a pointer. `struct msghdr` holds an `iovec`
+  array and a control-message list, and decoding it is a job of its own.
+- `sendto` takes its address in the fifth argument and is not decoded.
+- `statx` is not decoded. It has its own struct, and a glibc built after
+  2.33 reaches it for some `stat` calls, in which case you get
+  `syscall_332` with hex arguments and no complaint.
+- `st_atime`, `st_mtime` and `st_ctime` are not printed, so this cannot be
+  used to watch a timestamp change.
+- Socket families beyond `AF_UNIX`, `AF_INET` and `AF_INET6` print the
+  family number and nothing else. `AF_NETLINK` and `AF_PACKET` have their
+  own layouts.
+- An `iovec` array longer than 16 elements prints the first 16 and `...`,
+  and each buffer is cut at 32 bytes, which is what strace's default `-s`
+  does, so the two agree on where to cut.
+- The `struct stat` decoder reads into the host's own `struct stat`. That is
+  correct on x86-64 glibc, where the layout is the kernel's byte for byte,
+  and this program is x86-64 only, but it is a layout assumption rather than
+  a written-out kernel struct.
+- The st_uid/st_gid check needs a readable path whose owner and group are
+  different numbers. The harness looks through eight candidates and prints a
+  loud SKIP if none of them exists, because on a machine where every file is
+  owned by `uid:uid` a decoder that swaps the two fields cannot be caught.
+  `fchown` on our own file would be the obvious fix and returns EPERM in the
+  container this was developed in.
+- One mutation survives: reading the `struct stat` eight bytes short. Every
+  field that gets printed lives in the first 72 bytes, so a short read that
+  still covers them is genuinely equivalent to a correct one. Cutting the
+  read to 64 bytes, which does drop a printed field, fails three assertions,
+  so the boundary is where it should be and not further out.
 - No per-call timing. `-T` is absent, and its absence blocks the
   three-generation overhead table this project exists to produce.
 - `-p` cannot attach to a non-descendant where `ptrace_scope` is 1, which

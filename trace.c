@@ -10,14 +10,21 @@
 // change the traced program. Same exit status, same stdout, every time. t/ checks
 // that before it checks anything else.
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
+#include <sys/sysmacros.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -115,6 +122,7 @@ typedef struct {
   bool in_use;
   bool entering;
   long pending_nr;
+  unsigned long pending_args[6];   // arguments seen on entry, for the exit half
 } Tracee;
 
 #define MAX_TRACEES 512
@@ -175,32 +183,292 @@ static int path_arg(long nr) {
   }
 }
 
-// Reads a NUL-terminated string out of the tracee. process_vm_readv does it in
-// one call; PTRACE_PEEKDATA would need a word-at-a-time loop.
-static void read_string(pid_t pid, unsigned long addr, char *out, size_t cap) {
-  if (!addr) { snprintf(out, cap, "NULL"); return; }
+// Reads a fixed number of bytes out of the tracee. All struct decoding goes
+// through here, so a tracee that died or unmapped the page under us produces a
+// false return and a hex pointer, never a half-read struct printed as fact.
+static bool read_mem(pid_t pid, unsigned long addr, void *buf, size_t len) {
+  if (!addr || !len) return false;
+  struct iovec local = { .iov_base = buf, .iov_len = len };
+  struct iovec remote = { .iov_base = (void *)addr, .iov_len = len };
+  return process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)len;
+}
 
-  char raw[256];
-  size_t want = cap < sizeof(raw) ? cap : sizeof(raw);
-  struct iovec local = { .iov_base = raw, .iov_len = want - 1 };
-  struct iovec remote = { .iov_base = (void *)addr, .iov_len = want - 1 };
-
-  ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-  if (n <= 0) { snprintf(out, cap, "0x%lx", addr); return; }
-  raw[n] = 0;
-
-  // Escape it, so a path with a newline cannot forge a line of our own output.
+// Quote and escape n bytes of tracee memory, so a path or a buffer containing a
+// newline cannot forge a line of our own output.
+static void escape_into(const unsigned char *raw, size_t n, char *out, size_t cap) {
   size_t o = 0;
   out[o++] = '"';
-  for (ssize_t i = 0; i < n && raw[i] && o + 5 < cap; i++) {
+  for (size_t i = 0; i < n && o + 6 < cap; i++) {
     unsigned char c = raw[i];
     if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = c; }
     else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
     else if (c < 32 || c > 126) { o += snprintf(out + o, cap - o, "\\x%02x", c); }
     else out[o++] = c;
   }
-  if (o + 2 < cap) { out[o++] = '"'; }
+  if (o + 2 < cap) out[o++] = '"';
   out[o] = 0;
+}
+
+// Reads a NUL-terminated string out of the tracee. process_vm_readv does it in
+// one call; PTRACE_PEEKDATA would need a word-at-a-time loop.
+static void read_string(pid_t pid, unsigned long addr, char *out, size_t cap) {
+  if (!addr) { snprintf(out, cap, "NULL"); return; }
+
+  unsigned char raw[256];
+  size_t want = cap < sizeof(raw) ? cap : sizeof(raw);
+  struct iovec local = { .iov_base = raw, .iov_len = want - 1 };
+  struct iovec remote = { .iov_base = (void *)addr, .iov_len = want - 1 };
+
+  ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  if (n <= 0) { snprintf(out, cap, "0x%lx", addr); return; }
+  escape_into(raw, strnlen((char *)raw, (size_t)n), out, cap);
+}
+
+// ---------------------------------------------------------------- decoding
+
+// open(2) flags as names. The access mode is a 2-bit field, not a bit, so it
+// comes first and on its own; everything after it is a single bit.
+static void print_open_flags(unsigned long f) {
+  static const struct { unsigned long bit; const char *name; } BITS[] = {
+    // O_SYNC and O_TMPFILE are each two bits, and must be tested before the
+    // single bit they contain or they print as that bit instead.
+    { O_SYNC, "O_SYNC" }, { O_TMPFILE, "O_TMPFILE" },
+    { O_CREAT, "O_CREAT" }, { O_EXCL, "O_EXCL" }, { O_NOCTTY, "O_NOCTTY" },
+    { O_TRUNC, "O_TRUNC" }, { O_APPEND, "O_APPEND" }, { O_NONBLOCK, "O_NONBLOCK" },
+    { O_DSYNC, "O_DSYNC" }, { O_ASYNC, "O_ASYNC" }, { O_DIRECT, "O_DIRECT" },
+    { 0100000UL, "O_LARGEFILE" }, { O_DIRECTORY, "O_DIRECTORY" },
+    { O_NOFOLLOW, "O_NOFOLLOW" }, { O_NOATIME, "O_NOATIME" },
+    { O_CLOEXEC, "O_CLOEXEC" }, { O_PATH, "O_PATH" },
+  };
+  switch (f & O_ACCMODE) {
+  case O_RDONLY: fputs("O_RDONLY", stderr); break;
+  case O_WRONLY: fputs("O_WRONLY", stderr); break;
+  case O_RDWR:   fputs("O_RDWR", stderr); break;
+  default:       fputs("O_ACCMODE", stderr); break;
+  }
+  f &= ~(unsigned long)O_ACCMODE;
+  for (size_t i = 0; i < sizeof(BITS) / sizeof(BITS[0]); i++)
+    if ((f & BITS[i].bit) == BITS[i].bit) { fprintf(stderr, "|%s", BITS[i].name); f &= ~BITS[i].bit; }
+  if (f) fprintf(stderr, "|0x%lx", f);   // an unknown bit is shown, not dropped
+}
+
+// *at() flags. 0 prints as 0, as strace does.
+static void print_at_flags(unsigned long f) {
+  static const struct { unsigned long bit; const char *name; } BITS[] = {
+    { 0x100, "AT_SYMLINK_NOFOLLOW" }, { 0x200, "AT_EACCESS" },
+    { 0x400, "AT_REMOVEDIR" }, { 0x800, "AT_NO_AUTOMOUNT" },
+    { 0x1000, "AT_EMPTY_PATH" },
+  };
+  if (!f) { fputs("0", stderr); return; }
+  const char *sep = "";
+  for (size_t i = 0; i < sizeof(BITS) / sizeof(BITS[0]); i++)
+    if (f & BITS[i].bit) { fprintf(stderr, "%s%s", sep, BITS[i].name); sep = "|"; f &= ~BITS[i].bit; }
+  if (f) fprintf(stderr, "%s0x%lx", sep, f);
+}
+
+// A dirfd is an int, so AT_FDCWD arrives in the register as 0xffffff9c and
+// comparing the full 64-bit word against -100 never matches.
+static const char *dirfd_str(unsigned long raw) {
+  static char b[24];
+  int fd = (int)raw;
+  if (fd == AT_FDCWD) return "AT_FDCWD";
+  snprintf(b, sizeof(b), "%d", fd);
+  return b;
+}
+
+// struct stat. The glibc x86-64 layout is the kernel's byte for byte
+// (st_nlink before st_mode, a 4-byte pad after st_gid), which is why this can
+// read into one directly. That is an x86-64 fact, and this tracer is x86-64
+// only; a port would need the kernel struct written out by hand.
+//
+// shortcut: st_atime and friends are not printed. They are the three fields
+// whose value is a clock rather than a property of the file, so they cannot be
+// compared against the oracle in a second process at a second time. Printing
+// them needs them excluded from the differential, which is work for no reader.
+static void print_stat(pid_t pid, unsigned long addr) {
+  struct stat st;
+  if (!read_mem(pid, addr, &st, sizeof st)) { fprintf(stderr, "0x%lx", addr); return; }
+
+  const char *type = "S_IFREG";
+  switch (st.st_mode & S_IFMT) {
+  case S_IFDIR:  type = "S_IFDIR";  break;
+  case S_IFCHR:  type = "S_IFCHR";  break;
+  case S_IFBLK:  type = "S_IFBLK";  break;
+  case S_IFIFO:  type = "S_IFIFO";  break;
+  case S_IFLNK:  type = "S_IFLNK";  break;
+  case S_IFSOCK: type = "S_IFSOCK"; break;
+  case S_IFREG:  break;
+  default:       type = "S_IFMT";   break;
+  }
+  // setuid, setgid and sticky are named, not folded into the octal. They were
+  // folded into it until the oracle disagreed about /usr/bin/expiry, which is
+  // setgid: we said S_IFREG|02755 where strace says S_IFREG|S_ISGID|0755.
+  char special[32] = "";
+  if (st.st_mode & S_ISUID) strcat(special, "|S_ISUID");
+  if (st.st_mode & S_ISGID) strcat(special, "|S_ISGID");
+  if (st.st_mode & S_ISVTX) strcat(special, "|S_ISVTX");
+
+  fprintf(stderr,
+          "{st_dev=makedev(%u, %u), st_ino=%lu, st_mode=%s%s|0%03o, st_nlink=%lu, "
+          "st_uid=%u, st_gid=%u, st_blksize=%ld, st_blocks=%ld, st_size=%ld}",
+          major(st.st_dev), minor(st.st_dev), (unsigned long)st.st_ino,
+          type, special, (unsigned)(st.st_mode & 0777), (unsigned long)st.st_nlink,
+          (unsigned)st.st_uid, (unsigned)st.st_gid, (long)st.st_blksize,
+          (long)st.st_blocks, (long)st.st_size);
+}
+
+// An iovec array. Printing only element zero, or walking it with the wrong
+// stride, is the whole failure mode here, so the count comes from the syscall's
+// own argument and every element is read separately.
+#define IOV_SHOW 16      // shortcut: a longer array prints "..."; raising it is one number
+#define IOV_BYTES 32     // as strace's default -s, so the oracle truncates where we do
+static void print_iovec(pid_t pid, unsigned long addr, long cnt) {
+  if (cnt < 0 || !addr) { fprintf(stderr, "0x%lx", addr); return; }
+  fputs("[", stderr);
+  for (long i = 0; i < cnt && i < IOV_SHOW; i++) {
+    struct iovec v;
+    if (!read_mem(pid, addr + (unsigned long)i * sizeof v, &v, sizeof v)) {
+      fprintf(stderr, "%s...", i ? ", " : "");
+      break;
+    }
+    size_t n = v.iov_len < IOV_BYTES ? v.iov_len : IOV_BYTES;
+    unsigned char raw[IOV_BYTES];
+    char esc[IOV_BYTES * 4 + 8];
+    if (n && read_mem(pid, (unsigned long)v.iov_base, raw, n)) escape_into(raw, n, esc, sizeof esc);
+    else snprintf(esc, sizeof esc, "0x%lx", (unsigned long)v.iov_base);
+    fprintf(stderr, "%s{iov_base=%s%s, iov_len=%lu}", i ? ", " : "", esc,
+            v.iov_len > IOV_BYTES ? "..." : "", (unsigned long)v.iov_len);
+  }
+  if (cnt > IOV_SHOW) fputs(", ...", stderr);
+  fputs("]", stderr);
+}
+
+// struct sockaddr. The family decides how to read the rest, so it is read
+// first and nothing beyond addrlen is ever touched.
+static void print_sockaddr(pid_t pid, unsigned long addr, unsigned long len) {
+  struct sockaddr_storage ss;
+  memset(&ss, 0, sizeof ss);
+  size_t n = len > sizeof ss ? sizeof ss : (size_t)len;
+  if (n < sizeof(sa_family_t) || !read_mem(pid, addr, &ss, n)) {
+    fprintf(stderr, "0x%lx", addr);
+    return;
+  }
+  switch (ss.ss_family) {
+  case AF_INET: {
+    struct sockaddr_in *in = (struct sockaddr_in *)&ss;
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &in->sin_addr, ip, sizeof ip);
+    fprintf(stderr, "{sa_family=AF_INET, sin_port=htons(%u), sin_addr=inet_addr(\"%s\")}",
+            ntohs(in->sin_port), ip);
+    return;
+  }
+  case AF_INET6: {
+    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&ss;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip);
+    fprintf(stderr, "{sa_family=AF_INET6, sin6_port=htons(%u), inet_pton(AF_INET6, \"%s\", "
+                    "&sin6_addr), sin6_flowinfo=htonl(%u), sin6_scope_id=%u}",
+            ntohs(in6->sin6_port), ip, ntohl(in6->sin6_flowinfo), in6->sin6_scope_id);
+    return;
+  }
+  case AF_UNIX: {
+    struct sockaddr_un *un = (struct sockaddr_un *)&ss;
+    size_t plen = n > offsetof(struct sockaddr_un, sun_path)
+                ? n - offsetof(struct sockaddr_un, sun_path) : 0;
+    char esc[sizeof un->sun_path * 4 + 8];
+    if (plen && un->sun_path[0] == 0) {    // abstract: the name follows a NUL
+      escape_into((unsigned char *)un->sun_path + 1, plen - 1, esc, sizeof esc);
+      fprintf(stderr, "{sa_family=AF_UNIX, sun_path=@%s}", esc);
+    } else {
+      escape_into((unsigned char *)un->sun_path, strnlen(un->sun_path, plen), esc, sizeof esc);
+      fprintf(stderr, "{sa_family=AF_UNIX, sun_path=%s}", esc);
+    }
+    return;
+  }
+  default: {
+    // shortcut: other families print the number. AF_NETLINK and AF_PACKET have
+    // their own layouts and no test here reaches them; adding one is a case.
+    fprintf(stderr, "{sa_family=%u, ...}", (unsigned)ss.ss_family);
+    return;
+  }
+  }
+}
+
+// Does this syscall's struct get filled in by the kernel, so it can only be
+// printed on the exit half? Returns the argument index of the buffer, or -1.
+static int stat_buf_arg(long nr) {
+  switch (nr) {
+  case 4: case 6: case 5: return 1;    // stat, lstat, fstat
+  case 262:               return 2;    // newfstatat(dirfd, path, buf, flags)
+  default:                return -1;
+  }
+}
+
+// The entry half of one call: the name and everything known before the kernel
+// runs. Leaves the line open; the exit half closes it.
+static void print_entry(pid_t pid, long nr, const unsigned long *a) {
+  const char *nm = syscall_name(nr);
+  char path[512];
+
+  switch (nr) {
+  case 2:                                     // open(path, flags, mode)
+    read_string(pid, a[0], path, sizeof path);
+    fprintf(stderr, "%s(%s, ", nm, path);
+    print_open_flags(a[1]);
+    if (a[1] & O_CREAT) fprintf(stderr, ", 0%03o", (unsigned)(a[2] & 07777));
+    return;
+  case 257:                                   // openat(dirfd, path, flags, mode)
+    read_string(pid, a[1], path, sizeof path);
+    fprintf(stderr, "%s(%s, %s, ", nm, dirfd_str(a[0]), path);
+    print_open_flags(a[2]);
+    if (a[2] & O_CREAT) fprintf(stderr, ", 0%03o", (unsigned)(a[3] & 07777));
+    return;
+  case 19: case 20:                           // readv, writev (fd, iov, iovcnt)
+    fprintf(stderr, "%s(%ld, ", nm, (long)a[0]);
+    // readv's buffers are uninitialised here; only writev's are real data.
+    if (nr == 20) print_iovec(pid, a[1], (long)a[2]);
+    else fprintf(stderr, "0x%lx", a[1]);
+    fprintf(stderr, ", %ld", (long)a[2]);
+    return;
+  case 42: case 49:                           // connect, bind (fd, addr, addrlen)
+    fprintf(stderr, "%s(%ld, ", nm, (long)a[0]);
+    print_sockaddr(pid, a[1], a[2]);
+    fprintf(stderr, ", %lu", a[2]);
+    return;
+  case 4: case 6:                             // stat, lstat: struct at exit
+    read_string(pid, a[0], path, sizeof path);
+    fprintf(stderr, "%s(%s", nm, path);
+    return;
+  case 5:                                     // fstat(fd, buf)
+    fprintf(stderr, "%s(%ld", nm, (long)a[0]);
+    return;
+  case 262:                                   // newfstatat(dirfd, path, buf, flags)
+    read_string(pid, a[1], path, sizeof path);
+    fprintf(stderr, "%s(%s, %s", nm, dirfd_str(a[0]), path);
+    return;
+  default: break;
+  }
+
+  int pi = path_arg(nr);
+  if (pi >= 0) {
+    read_string(pid, a[pi], path, sizeof path);
+    if (pi == 0) fprintf(stderr, "%s(%s, ...", nm, path);
+    else         fprintf(stderr, "%s(%ld, %s, ...", nm, (long)a[0], path);
+  } else {
+    fprintf(stderr, "%s(0x%lx, 0x%lx, 0x%lx", nm, a[0], a[1], a[2]);
+  }
+}
+
+// The arguments the kernel wrote, printed on the exit half because they do not
+// exist yet on entry. A failed call wrote nothing, so the pointer is printed
+// instead of a struct full of whatever was there before.
+static void print_exit_args(pid_t pid, long nr, const unsigned long *a, long ret) {
+  int bi = stat_buf_arg(nr);
+  if (bi < 0) return;
+  fputs(", ", stderr);
+  if (ret == 0) print_stat(pid, a[bi]);
+  else fprintf(stderr, "0x%lx", a[bi]);
+  if (nr == 262) { fputs(", ", stderr); print_at_flags(a[3]); }
 }
 
 static int cmp_count(const void *a, const void *b) {
@@ -434,18 +702,14 @@ int main(int argc, char **argv) {
       // keyed on the same number, because one call is printed by two stops:
       // the name and arguments on entry, the result on exit. Gating only one
       // of them would leave a dangling open paren or an orphan " = 0".
+      // Kept for the exit half: a struct the kernel fills in can only be read
+      // after the call returns, and rax has been overwritten by then.
+      unsigned long a[6] = { regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9 };
+      memcpy(t->pending_args, a, sizeof a);
+
       if (!count_only && is_shown(nr)) {
-        int pi = path_arg(nr);
-        unsigned long a[6] = { regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9 };
         line_prefix(who);
-        if (pi >= 0) {
-          char path[512];
-          read_string(who, a[pi], path, sizeof(path));
-          if (pi == 0) fprintf(stderr, "%s(%s, ...", syscall_name(nr), path);
-          else         fprintf(stderr, "%s(%ld, %s, ...", syscall_name(nr), (long)a[0], path);
-        } else {
-          fprintf(stderr, "%s(0x%lx, 0x%lx, 0x%lx", syscall_name(nr), a[0], a[1], a[2]);
-        }
+        print_entry(who, nr, a);
       }
       t->entering = false;
     } else {
@@ -457,6 +721,7 @@ int main(int argc, char **argv) {
       if (is_err && nr >= 0 && nr < 512) errors[nr]++;
 
       if (!count_only && is_shown(nr)) {
+        print_exit_args(who, nr, t->pending_args, is_err ? -1 : ret);
         if (is_err) fprintf(stderr, ") = -1 %s\n", strerror((int)-ret));
         else        fprintf(stderr, ") = %ld\n", ret);
       }

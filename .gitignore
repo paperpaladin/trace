@@ -1,3 +1,4 @@
 /trace
 t/*.bin
 t/*.tmp
+t/tmp.*
